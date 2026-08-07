@@ -28,13 +28,21 @@ const DEFAULT_PACKAGE_NAME = "cline";
 // (e.g. "ConnorVG/cline") into the compiled binary at build time; upstream and
 // dev builds leave it empty, so this policy is inert there.
 //
+// The fork can live on GitHub (default) or on a self-hosted Gitea/Forgejo
+// instance: set `CLINE_FORK_HOST` to the instance hostname
+// (e.g. "gitea.example.com") alongside `CLINE_FORK_REPO`. Version checks then
+// hit `{host}/api/v1/repos/{owner}/{repo}/releases/latest` and downloads come
+// from `{host}/{owner}/{repo}/releases/latest/download/<asset>`, both of which
+// Gitea and Forgejo implement.
+//
 // When a fork repo is set:
 //   - startup auto-update is disabled entirely — the stock npm package lacks
 //     our fixes and an auto-update would silently replace the fork build;
 //   - version checks and manual `cline update` resolve against the fork's
-//     GitHub Releases (assets named `cline-<os>-<arch>[.exe]`) and replace
-//     the running binary in place (Unix; Windows updates manually).
+//     releases (assets named `cline-<os>-<arch>[.exe]`) and replace the
+//     running binary in place (Unix; Windows updates manually).
 const getForkRepo = (): string | null => process.env.CLINE_FORK_REPO?.trim() || null;
+const getForkHost = (): string | null => process.env.CLINE_FORK_HOST?.trim() || null;
 
 type CliPackageName = typeof DEFAULT_PACKAGE_NAME;
 
@@ -197,7 +205,8 @@ function buildForkBinaryUpdateCommand(
 		return undefined;
 	}
 	const asset = forkReleaseAssetName();
-	const url = `https://github.com/${forkRepo}/releases/latest/download/${asset}`;
+	const host = getForkHost() ?? "github.com";
+	const url = `https://${host}/${forkRepo}/releases/latest/download/${asset}`;
 	return `curl -fsSL '${url}' -o "${scriptPath}" && chmod +x "${scriptPath}"`;
 }
 
@@ -242,20 +251,22 @@ async function getLatestVersion(
 }
 
 /**
- * Resolve the latest fork release version from its GitHub Releases.
+ * Resolve the latest fork release version from its releases.
  * Releases are tagged `cli-vX.Y.Z`; returns `X.Y.Z`.
+ * GitHub: api.github.com; Gitea/Forgejo (CLINE_FORK_HOST): {host}/api/v1.
  */
 async function getLatestForkVersion(forkRepo: string): Promise<string | null> {
 	try {
-		const res = await fetch(
-			`https://api.github.com/repos/${forkRepo}/releases/latest`,
-			{
-				headers: {
-					Accept: "application/vnd.github+json",
-					"User-Agent": "cline",
-				},
+		const host = getForkHost();
+		const apiUrl = host
+			? `https://${host}/api/v1/repos/${forkRepo}/releases/latest`
+			: `https://api.github.com/repos/${forkRepo}/releases/latest`;
+		const res = await fetch(apiUrl, {
+			headers: {
+				Accept: "application/vnd.github+json",
+				"User-Agent": "cline",
 			},
-		);
+		});
 		if (!res.ok) return null;
 		const data = (await res.json()) as { tag_name?: string };
 		const match = data.tag_name?.match(/^cli-v(\d+\.\d+\.\d+)/);

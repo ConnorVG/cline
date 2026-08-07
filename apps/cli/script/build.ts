@@ -37,9 +37,11 @@ const BUILD_TIME_INLINED_ENV_VARS = [
 	"OTEL_EXPORTER_OTLP_HEADERS",
 	// When set (e.g. "ConnorVG/cline"), the compiled binary is a fork build:
 	// startup auto-update is disabled and `cline update` resolves against the
-	// fork's GitHub Releases instead of the stock npm channel. Left empty for
-	// upstream builds so stock update behavior is unchanged.
+	// fork's releases instead of the stock npm channel. CLINE_FORK_HOST points
+	// at a self-hosted Gitea/Forgejo instance when the fork is not on GitHub.
+	// Left empty for upstream builds so stock update behavior is unchanged.
 	"CLINE_FORK_REPO",
+	"CLINE_FORK_HOST",
 ] as const;
 
 function buildInlinedEnvDefines(): Record<string, string> {

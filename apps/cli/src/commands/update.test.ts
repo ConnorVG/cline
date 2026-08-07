@@ -41,6 +41,7 @@ const originalGlobalSettingsPath = process.env.CLINE_GLOBAL_SETTINGS_PATH;
 const originalIsDev = process.env.IS_DEV;
 const originalNoAutoUpdate = process.env.CLINE_NO_AUTO_UPDATE;
 const originalForkRepo = process.env.CLINE_FORK_REPO;
+const originalForkHost = process.env.CLINE_FORK_HOST;
 const tempDirs: string[] = [];
 
 function createChildProcessThatCloses(exitCode: number): ChildProcess {
@@ -105,6 +106,11 @@ describe("getInstallationInfo", () => {
 			delete process.env.CLINE_FORK_REPO;
 		} else {
 			process.env.CLINE_FORK_REPO = originalForkRepo;
+		}
+		if (originalForkHost === undefined) {
+			delete process.env.CLINE_FORK_HOST;
+		} else {
+			process.env.CLINE_FORK_HOST = originalForkHost;
 		}
 		vi.restoreAllMocks();
 		for (const dir of tempDirs.splice(0)) {
@@ -171,6 +177,11 @@ describe("fork update policy", () => {
 		} else {
 			process.env.CLINE_FORK_REPO = originalForkRepo;
 		}
+		if (originalForkHost === undefined) {
+			delete process.env.CLINE_FORK_HOST;
+		} else {
+			process.env.CLINE_FORK_HOST = originalForkHost;
+		}
 		vi.restoreAllMocks();
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
@@ -225,6 +236,41 @@ describe("fork update policy", () => {
 
 		const url = fetchSpy.mock.calls[0]?.[0] as string;
 		expect(url).toContain("api.github.com/repos/ConnorVG/cline/releases/latest");
+	});
+
+	it("downloads fork binaries from a self-hosted Gitea instance", () => {
+		process.env.CLINE_FORK_REPO = "connorvg/cline";
+		process.env.CLINE_FORK_HOST = "gitea.example.com";
+		const binaryPath = createTempFile("bin/cline");
+		delete process.env.CLINE_WRAPPER_PATH;
+		process.argv = ["bun", binaryPath, "update", "--verbose"];
+
+		const info = getInstallationInfo("1.2.3");
+
+		expect(info.updateCommand).toContain(
+			"https://gitea.example.com/connorvg/cline/releases/latest/download/",
+		);
+		expect(info.updateCommand).toContain(binaryPath);
+	});
+
+	it("checks a self-hosted Gitea fork's releases for manual updates", async () => {
+		process.env.CLINE_FORK_REPO = "connorvg/cline";
+		process.env.CLINE_FORK_HOST = "gitea.example.com";
+		const settingsPath = createTempFile("data/global-settings.json");
+		writeFileSync(settingsPath, JSON.stringify({ autoUpdateEnabled: false }));
+		process.env.CLINE_GLOBAL_SETTINGS_PATH = settingsPath;
+		delete process.env.CLINE_NO_AUTO_UPDATE;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+			ok: true,
+			json: async () => ({ tag_name: "cli-v9.9.9" }),
+		} as Response);
+
+		await checkForUpdates({ includeKanban: false });
+
+		const url = fetchSpy.mock.calls[0]?.[0] as string;
+		expect(url).toContain(
+			"gitea.example.com/api/v1/repos/connorvg/cline/releases/latest",
+		);
 	});
 });
 

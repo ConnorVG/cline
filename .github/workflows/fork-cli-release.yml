@@ -10,8 +10,19 @@
 #
 # The fork update policy is baked into the binaries via `CLINE_FORK_REPO`
 # (see apps/cli/src/commands/update.ts): startup auto-update is disabled and
-# `cline update` resolves against THIS fork's GitHub Releases instead of the
-# stock npm `cline` package.
+# `cline update` resolves against THIS fork's releases instead of the stock
+# npm `cline` package.
+#
+# Migrating to a self-hosted Gitea/Forgejo instance:
+#   - Move this file to `.gitea/workflows/fork-cli-release.yml` (Gitea Actions
+#     is largely GitHub-Actions compatible; `actions/*`, `oven-sh/setup-bun`,
+#     and `actions/setup-node` all work).
+#   - Replace the release-publish step's `gh` calls with the Gitea API
+#     (`POST /api/v1/repos/{owner}/{repo}/releases` + upload attachments)
+#     using a Gitea token secret.
+#   - Set `CLINE_FORK_REPO` and `CLINE_FORK_HOST` build envs so the binaries
+#     carry the Gitea update policy (the update.ts code already supports it).
+#   - Re-point git remotes for t3code + cline to the Gitea origin.
 #
 # Release flow:
 #   1. bump apps/cli/package.json version (e.g. 3.0.52)
