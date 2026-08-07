@@ -819,7 +819,14 @@ export async function runCli(): Promise<void> {
 		// Only an explicit `--auto-approve true` (or `--yolo`) enables
 		// auto-approval in ACP mode; We do not respect the default to
 		// avoid accidental auto-approval in ACP mode.
-		await runAcpMode({ autoApproveTools: args.autoApproveOverride === true });
+		// Forward the -P/--provider and -m/--model flags so ACP sessions use
+		// the same provider/model the user selected on the CLI (previously
+		// these were parsed but silently dropped in ACP mode).
+		await runAcpMode({
+			autoApproveTools: args.autoApproveOverride === true,
+			providerId: args.provider,
+			modelId: args.model,
+		});
 		return;
 	}
 

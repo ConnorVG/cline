@@ -28,6 +28,7 @@ import {
 	type ClineCore,
 	Llms,
 	ProviderSettingsManager,
+	resolveProviderConfig,
 	SessionSource,
 } from "@cline/core";
 import { isLikelyAuthError, type Message } from "@cline/shared";
@@ -101,6 +102,8 @@ interface SessionState {
 	fatalError?: Error;
 	/** Messages to inject into the next session manager for conversation continuity. */
 	pendingInitialMessages?: Message[];
+	/** Resolved provider catalog, reused across prompts to avoid re-fetching. */
+	providerCatalog?: Record<string, Llms.ModelInfo>;
 }
 
 export class AcpAgent implements Agent {
@@ -108,16 +111,21 @@ export class AcpAgent implements Agent {
 	private readonly conn: AgentSideConnection;
 	private readonly providerSettingsManager = new ProviderSettingsManager();
 	private readonly defaultAutoApproveTools: boolean;
+	/** Explicit provider/model from the CLI `-P`/`-m` flags, if given. */
+	private readonly cliProviderId?: string;
+	private readonly cliModelId?: string;
 
 	/** Set after a successful `authenticate` call. */
 	private authResult?: AcpAuthResult;
 
 	constructor(
 		conn: AgentSideConnection,
-		options?: { autoApproveTools?: boolean },
+		options?: { autoApproveTools?: boolean; providerId?: string; modelId?: string },
 	) {
 		this.conn = conn;
 		this.defaultAutoApproveTools = options?.autoApproveTools ?? false;
+		this.cliProviderId = options?.providerId?.trim() || undefined;
+		this.cliModelId = options?.modelId?.trim() || undefined;
 	}
 
 	async initialize(_params: InitializeRequest): Promise<InitializeResponse> {
@@ -183,27 +191,30 @@ export class AcpAgent implements Agent {
 
 		const defaultMode = "act";
 		const providerId =
-			process.env.CLINE_PROVIDER ?? this.authResult?.providerId ?? "cline";
+			this.cliProviderId ??
+			process.env.CLINE_PROVIDER ??
+			this.authResult?.providerId ??
+			"cline";
 
-		const providerModels = await Llms.getModelsForProvider(providerId);
-		// Model ids are provider-scoped, so the default must come from the
-		// provider's own catalog: `cline-pass` uses `cline-pass/…` ids that mean
-		// nothing to `cline`, and vice versa.
-		const defaultModelId = await resolveDefaultModelId(
-			providerId,
-			process.env.CLINE_MODEL,
-			providerModels,
-		);
-
-		this.sessions.set(sessionId, {
+		const session: SessionState = {
 			id: sessionId,
 			cwd: params.cwd,
 			mcpServers: params.mcpServers,
 			currentMode: defaultMode,
 			currentProviderId: providerId,
-			currentModelId: defaultModelId,
+			currentModelId: "pending",
 			autoApproveTools: this.defaultAutoApproveTools,
-		});
+		};
+
+		// Resolve the provider's catalog (cached on the session so prompts
+		// don't re-fetch it), then pick the default model from it.
+		const providerModels = await this.resolveProviderCatalog(session, providerId);
+		session.currentModelId = await resolveDefaultModelId(
+			providerId,
+			this.cliModelId ?? process.env.CLINE_MODEL,
+			providerModels,
+		);
+		this.sessions.set(sessionId, session);
 
 		const availableModels = Object.entries(providerModels).map(
 			([modelId, info]) => ({
@@ -224,11 +235,11 @@ export class AcpAgent implements Agent {
 			},
 			models: {
 				availableModels,
-				currentModelId: defaultModelId,
+				currentModelId: session.currentModelId,
 			},
 			configOptions: [
 				await buildProviderConfigOption(providerId),
-				buildModelConfigOption(defaultModelId, providerModels),
+				buildModelConfigOption(session.currentModelId, providerModels),
 				buildModeConfigOption(defaultMode),
 				buildAutoApproveConfigOption(this.defaultAutoApproveTools),
 				...(organizationOption ? [organizationOption] : []),
@@ -255,21 +266,26 @@ export class AcpAgent implements Agent {
 				// as a new session, with the model resolved against the
 				// provider's own catalog just like newSession.
 				const providerId =
-					process.env.CLINE_PROVIDER ?? this.authResult?.providerId ?? "cline";
-				const providerModels = await Llms.getModelsForProvider(providerId);
+					this.cliProviderId ??
+					process.env.CLINE_PROVIDER ??
+					this.authResult?.providerId ??
+					"cline";
 				session = {
 					id: params.sessionId,
 					cwd: params.cwd,
 					mcpServers: params.mcpServers,
 					currentMode: "act",
 					currentProviderId: providerId,
-					currentModelId: await resolveDefaultModelId(
-						providerId,
-						process.env.CLINE_MODEL,
-						providerModels,
-					),
+					currentModelId: "pending",
 					autoApproveTools: this.defaultAutoApproveTools,
 				};
+				const providerModels = await this.resolveProviderCatalog(session, providerId);
+				session.currentModelId = await resolveDefaultModelId(
+					providerId,
+					this.cliModelId ?? process.env.CLINE_MODEL,
+					providerModels,
+				);
+				session.providerCatalog = providerModels;
 				this.sessions.set(params.sessionId, session);
 			}
 			try {
@@ -429,12 +445,19 @@ export class AcpAgent implements Agent {
 			throw new Error(`unknown session: ${params.sessionId}`);
 		}
 		session.currentModelId = params.modelId;
-		if (session.sessionManager && session.activeSessionId) {
-			await session.sessionManager.updateSessionModel?.(
-				session.activeSessionId,
-				params.modelId,
-			);
-		}
+		// Model switching mid-session: record the new model for future
+		// sessions, but leave the running session manager alone.
+		//
+		// Updating the live manager in place (via `updateSessionModel`) or
+		// rebuilding it leaves the following turn hanging with no assistant
+		// content (verified against cline 3.0.51 ACP: the second ClineCore in
+		// a process stalls inside AgentRuntime.run). The safe behavior is to
+		// apply the new model to the next session the client starts; the
+		// current session keeps its existing model so nothing breaks.
+		//
+		// t3code drives model selection BEFORE the first prompt (right after
+		// session/new), when no session manager exists yet — that path is
+		// fully supported and applies the model to the session's first turn.
 		return {};
 	}
 
@@ -505,12 +528,9 @@ export class AcpAgent implements Agent {
 
 			case "model": {
 				session.currentModelId = value;
-				if (session.sessionManager && session.activeSessionId) {
-					await session.sessionManager.updateSessionModel?.(
-						session.activeSessionId,
-						value,
-					);
-				}
+				// Same rationale as unstable_setSessionModel: an in-place
+				// updateSessionModel or a manager rebuild leaves the next turn
+				// hanging with no assistant content. Apply to future sessions.
 				break;
 			}
 
@@ -744,12 +764,49 @@ export class AcpAgent implements Agent {
 		return initialMessages;
 	}
 
+	/**
+	 * Resolve the provider's model catalog (provider-scoped ids).
+	 *
+	 * Mirrors the non-ACP CLI path: the provider's persisted config plus a
+	 * live catalog fetch, so the ids returned are valid for THIS provider
+	 * (litellm's 6 models, claude-code's set, ...), not the static `cline`
+	 * fallback. The result is cached on the session so subsequent prompts
+	 * don't re-fetch the network catalog.
+	 */
+	private async resolveProviderCatalog(
+		session: SessionState | undefined,
+		providerId: string,
+	): Promise<Record<string, Llms.ModelInfo>> {
+		if (session?.providerCatalog) {
+			return session.providerCatalog;
+		}
+		const persistedConfig = this.providerSettingsManager.getProviderConfig(providerId, {
+			includeKnownModels: false,
+		});
+		let catalog: Record<string, Llms.ModelInfo> | undefined;
+		try {
+			const resolved = await resolveProviderConfig(
+				providerId,
+				{ loadLatestOnInit: true, loadPrivateOnAuth: true, failOnError: false },
+				persistedConfig,
+			);
+			catalog = resolved?.knownModels;
+		} catch {
+			// Live catalog resolution is best-effort; fall through to static.
+		}
+		catalog ??= await Llms.getModelsForProvider(providerId);
+		if (session) {
+			session.providerCatalog = catalog;
+		}
+		return catalog;
+	}
+
 	private async buildConfig(session: SessionState): Promise<Config> {
 		const cwd = session.cwd || process.cwd();
 		const workspaceRoot = resolveWorkspaceRoot(cwd);
-		// Resolve credentials: env vars take precedence, then session provider.
-		const providerId = process.env.CLINE_PROVIDER ?? session.currentProviderId;
-		const apiKey = process.env.CLINE_API_KEY ?? this.authResult?.apiKey ?? "";
+		// Resolve credentials: CLI -P flag takes precedence, then env vars, then session provider.
+		const providerId =
+			this.cliProviderId ?? process.env.CLINE_PROVIDER ?? session.currentProviderId;
 		const systemPrompt = await resolveSystemPrompt({
 			cwd,
 			providerId,
@@ -757,10 +814,30 @@ export class AcpAgent implements Agent {
 		});
 		const cliBuildInfo = getCliBuildInfo();
 
+		// Resolve the provider's persisted config (per-provider API key, base
+		// URL, headers) and its own model catalog. The non-ACP CLI path does
+		// exactly this; the ACP path previously used only the `cline` account's
+		// credentials and a hardcoded fallback catalog, which made the provider
+		// actually used (litellm, claude-code, ...) resolve the wrong API key
+		// and reject model ids that are valid for it.
+		const persistedConfig =
+			this.providerSettingsManager.getProviderConfig(providerId, {
+				includeKnownModels: false,
+			});
+		const knownModels = await this.resolveProviderCatalog(session, providerId);
+		const apiKey =
+			process.env.CLINE_API_KEY ??
+			persistedConfig?.apiKey ??
+			this.authResult?.apiKey ??
+			"";
+
 		return {
 			providerId,
 			modelId: session.currentModelId,
 			apiKey,
+			...(persistedConfig?.baseUrl ? { baseUrl: persistedConfig.baseUrl } : {}),
+			...(persistedConfig?.headers ? { headers: persistedConfig.headers } : {}),
+			knownModels,
 			systemPrompt,
 			execution: undefined,
 			verbose: false,

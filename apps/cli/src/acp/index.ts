@@ -3,6 +3,8 @@ import { writeDiagnostic } from "../utils/output";
 
 export interface AcpModeOptions {
 	autoApproveTools?: boolean;
+	providerId?: string;
+	modelId?: string;
 }
 
 export async function runAcpMode(options?: AcpModeOptions): Promise<void> {
@@ -21,6 +23,8 @@ export async function runAcpMode(options?: AcpModeOptions): Promise<void> {
 	const connection = new AgentSideConnection((conn) => {
 		return new AcpAgent(conn, {
 			autoApproveTools: options?.autoApproveTools,
+			providerId: options?.providerId,
+			modelId: options?.modelId,
 		});
 	}, stream);
 
