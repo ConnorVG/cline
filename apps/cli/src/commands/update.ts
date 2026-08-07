@@ -22,6 +22,20 @@ import {
 
 const DEFAULT_PACKAGE_NAME = "cline";
 
+// ── Fork update policy ─────────────────────────────────────────────────────
+// This build may be a personal fork (e.g. ConnorVG/cline) with fixes that are
+// NOT in the stock npm `cline` package. The fork CI inlines `CLINE_FORK_REPO`
+// (e.g. "ConnorVG/cline") into the compiled binary at build time; upstream and
+// dev builds leave it empty, so this policy is inert there.
+//
+// When a fork repo is set:
+//   - startup auto-update is disabled entirely — the stock npm package lacks
+//     our fixes and an auto-update would silently replace the fork build;
+//   - version checks and manual `cline update` resolve against the fork's
+//     GitHub Releases (assets named `cline-<os>-<arch>[.exe]`) and replace
+//     the running binary in place (Unix; Windows updates manually).
+const getForkRepo = (): string | null => process.env.CLINE_FORK_REPO?.trim() || null;
+
 type CliPackageName = typeof DEFAULT_PACKAGE_NAME;
 
 export enum PackageManager {
@@ -95,6 +109,17 @@ export function getInstallationInfo(currentVersion: string): InstallationInfo {
 			process.env.CLINE_WRAPPER_PATH || process.argv[1] || "",
 		).replace(/\\/g, "/");
 
+		const forkRepo = getForkRepo();
+		if (forkRepo) {
+			// Fork builds are distributed as standalone release binaries. Never
+			// resolve the stock npm package, regardless of install location.
+			return {
+				packageManager: PackageManager.UNKNOWN,
+				packageName: DEFAULT_PACKAGE_NAME,
+				updateCommand: buildForkBinaryUpdateCommand(forkRepo, scriptPath),
+			};
+		}
+
 		if (scriptPath.includes("/.npm/_npx") || scriptPath.includes("/npm/_npx")) {
 			return {
 				packageManager: PackageManager.NPX,
@@ -146,6 +171,36 @@ export function getInstallationInfo(currentVersion: string): InstallationInfo {
 	};
 }
 
+/** Asset name for a fork release binary on the current platform, e.g. `cline-linux-x64`. */
+function forkReleaseAssetName(): string {
+	const osName =
+		process.platform === "win32"
+			? "windows"
+			: process.platform === "darwin"
+				? "darwin"
+				: process.platform;
+	const arch = process.arch === "x64" ? "x64" : process.arch === "arm64" ? "arm64" : process.arch;
+	return `cline-${osName}-${arch}${process.platform === "win32" ? ".exe" : ""}`;
+}
+
+/**
+ * Build the self-update command for a fork binary: download the matching
+ * release asset over the currently running binary. On Windows the running
+ * `.exe` cannot be overwritten in place, so we return `undefined` and let
+ * `cline update` direct the user to the release download instead.
+ */
+function buildForkBinaryUpdateCommand(
+	forkRepo: string,
+	scriptPath: string,
+): string | undefined {
+	if (process.platform === "win32") {
+		return undefined;
+	}
+	const asset = forkReleaseAssetName();
+	const url = `https://github.com/${forkRepo}/releases/latest/download/${asset}`;
+	return `curl -fsSL '${url}' -o "${scriptPath}" && chmod +x "${scriptPath}"`;
+}
+
 export function withMinimumReleaseAgeBypass(
 	updateCommand: string,
 	packageManager: PackageManager,
@@ -178,8 +233,36 @@ async function getLatestVersion(
 	packageName: CliPackageName,
 	currentVersion: string,
 ): Promise<string | null> {
+	const forkRepo = getForkRepo();
+	if (forkRepo) {
+		return getLatestForkVersion(forkRepo);
+	}
 	const tag = getNpmTag(currentVersion);
 	return getLatestPackageVersion(packageName, tag);
+}
+
+/**
+ * Resolve the latest fork release version from its GitHub Releases.
+ * Releases are tagged `cli-vX.Y.Z`; returns `X.Y.Z`.
+ */
+async function getLatestForkVersion(forkRepo: string): Promise<string | null> {
+	try {
+		const res = await fetch(
+			`https://api.github.com/repos/${forkRepo}/releases/latest`,
+			{
+				headers: {
+					Accept: "application/vnd.github+json",
+					"User-Agent": "cline",
+				},
+			},
+		);
+		if (!res.ok) return null;
+		const data = (await res.json()) as { tag_name?: string };
+		const match = data.tag_name?.match(/^cli-v(\d+\.\d+\.\d+)/);
+		return match ? match[1] : null;
+	} catch {
+		return null;
+	}
 }
 
 async function getLatestPackageVersion(
@@ -401,6 +484,9 @@ async function restartHubServerIfRunning(): Promise<void> {
  * Skipped for npx, dev, unknown installs. Disable with CLINE_NO_AUTO_UPDATE=1.
  */
 export function autoUpdateOnStartup(): void {
+	// Fork builds never auto-update: the stock npm package lacks our fixes
+	// and an auto-update would silently replace the fork build.
+	if (getForkRepo()) return;
 	if (process.env.IS_DEV === "true") return;
 	if (process.env.CLINE_NO_AUTO_UPDATE === "1") return;
 	if (!isAutoUpdateEnabledGlobally()) return;

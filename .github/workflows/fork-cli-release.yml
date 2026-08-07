@@ -1,0 +1,115 @@
+# fork-cli-release
+#
+# Builds the Cline CLI from this fork and publishes standalone platform
+# binaries as a GitHub Release, so the fork build can be downloaded and
+# installed on any machine (this is how the fork's ACP fixes are distributed).
+#
+# Triggers:
+#   - Manual (workflow_dispatch): build + publish a release.
+#   - Push a `cli-vX.Y.Z` tag: build + publish a release.
+#
+# The fork update policy is baked into the binaries via `CLINE_FORK_REPO`
+# (see apps/cli/src/commands/update.ts): startup auto-update is disabled and
+# `cline update` resolves against THIS fork's GitHub Releases instead of the
+# stock npm `cline` package.
+#
+# Release flow:
+#   1. bump apps/cli/package.json version (e.g. 3.0.52)
+#   2. push a tag: git tag cli-v3.0.52 && git push origin cli-v3.0.52
+#   (or run this workflow manually; it publishes at the current package version)
+name: fork-cli-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version override (must equal apps/cli/package.json version). Defaults to the package version."
+        required: false
+        type: string
+  push:
+    tags:
+      - "cli-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build platform binaries and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.13"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24.x"
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build SDK packages
+        run: bun run build:sdk
+
+      - name: Typecheck CLI
+        working-directory: apps/cli
+        run: npx tsc --noEmit
+
+      - name: Run fork-focused CLI tests (acp + update policy)
+        working-directory: apps/cli
+        run: npx vitest run src/acp src/commands/update.test.ts --testTimeout=20000
+
+      - name: Determine release version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./apps/cli/package.json').version")
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            if [ "${{ github.event.inputs.version }}" != "$VERSION" ]; then
+              echo "Input version ${{ github.event.inputs.version }} does not match package.json version ${VERSION}" >&2
+              exit 1
+            fi
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build platform binaries (fork)
+        working-directory: apps/cli
+        env:
+          # Bakes the fork update policy into the binaries.
+          CLINE_FORK_REPO: ConnorVG/cline
+        run: bun script/build.ts --install-native-variants --skip-sdk-build
+
+      - name: Stage release assets with friendly names
+        run: |
+          mkdir -p dist/release
+          cp apps/cli/dist/cli-linux-x64/bin/cline      dist/release/cline-linux-x64
+          cp apps/cli/dist/cli-linux-arm64/bin/cline     dist/release/cline-linux-arm64
+          cp apps/cli/dist/cli-darwin-x64/bin/cline      dist/release/cline-darwin-x64
+          cp apps/cli/dist/cli-darwin-arm64/bin/cline     dist/release/cline-darwin-arm64
+          cp apps/cli/dist/cli-windows-x64/bin/cline.exe dist/release/cline-windows-x64.exe
+          cp apps/cli/dist/cli-windows-arm64/bin/cline.exe dist/release/cline-windows-arm64.exe
+          chmod +x dist/release/cline-linux-* dist/release/cline-darwin-*
+          (cd dist/release && sha256sum cline-* > SHA256SUMS)
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          TAG="cli-v${VERSION}"
+          NOTES="Cline CLI fork build v${VERSION} — includes ACP fixes (see ConnorVG/cline) and a fork update policy (no stock npm auto-update; \`cline update\` resolves this fork's GitHub Releases)."
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/release/* --clobber
+            gh release edit "${TAG}" --title "Cline fork v${VERSION}" --notes "${NOTES}"
+          else
+            gh release create "${TAG}" dist/release/* --title "Cline fork v${VERSION}" --notes "${NOTES}"
+          fi

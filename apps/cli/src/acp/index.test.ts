@@ -35,10 +35,6 @@ describe("runAcpMode", () => {
 	});
 
 	it("forwards the CLI -P/--provider and -m/--model flags to the ACP agent", async () => {
-		const stderrWrite = vi
-			.spyOn(process.stderr, "write")
-			.mockImplementation(() => true);
-
 		let agentOptions: unknown;
 		vi.doMock("@agentclientprotocol/sdk", () => ({
 			ndJsonStream: vi.fn(() => ({})),

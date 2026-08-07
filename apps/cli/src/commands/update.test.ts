@@ -40,6 +40,7 @@ const originalWrapperPath = process.env.CLINE_WRAPPER_PATH;
 const originalGlobalSettingsPath = process.env.CLINE_GLOBAL_SETTINGS_PATH;
 const originalIsDev = process.env.IS_DEV;
 const originalNoAutoUpdate = process.env.CLINE_NO_AUTO_UPDATE;
+const originalForkRepo = process.env.CLINE_FORK_REPO;
 const tempDirs: string[] = [];
 
 function createChildProcessThatCloses(exitCode: number): ChildProcess {
@@ -100,6 +101,11 @@ describe("getInstallationInfo", () => {
 		} else {
 			process.env.CLINE_NO_AUTO_UPDATE = originalNoAutoUpdate;
 		}
+		if (originalForkRepo === undefined) {
+			delete process.env.CLINE_FORK_REPO;
+		} else {
+			process.env.CLINE_FORK_REPO = originalForkRepo;
+		}
 		vi.restoreAllMocks();
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
@@ -154,6 +160,71 @@ describe("getInstallationInfo", () => {
 			packageManager: PackageManager.UNKNOWN,
 			packageName: "cline",
 		});
+	});
+});
+
+describe("fork update policy", () => {
+	afterEach(() => {
+		process.argv = [...originalArgv];
+		if (originalForkRepo === undefined) {
+			delete process.env.CLINE_FORK_REPO;
+		} else {
+			process.env.CLINE_FORK_REPO = originalForkRepo;
+		}
+		vi.restoreAllMocks();
+		for (const dir of tempDirs.splice(0)) {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a fork build to the fork's GitHub release binary", () => {
+		process.env.CLINE_FORK_REPO = "ConnorVG/cline";
+		// A standalone compiled binary install (not under a package-manager tree).
+		const binaryPath = createTempFile("bin/cline");
+		delete process.env.CLINE_WRAPPER_PATH;
+		process.argv = ["bun", binaryPath, "update", "--verbose"];
+
+		const info = getInstallationInfo("1.2.3");
+
+		expect(info.packageManager).toBe(PackageManager.UNKNOWN);
+		expect(info.packageName).toBe("cline");
+		expect(info.updateCommand).toContain(
+			"https://github.com/ConnorVG/cline/releases/latest/download/",
+		);
+		expect(info.updateCommand).toContain(binaryPath);
+	});
+
+	it("never auto-updates on startup for a fork build", () => {
+		process.env.CLINE_FORK_REPO = "ConnorVG/cline";
+		const settingsPath = createTempFile("data/global-settings.json");
+		writeFileSync(settingsPath, JSON.stringify({ autoUpdateEnabled: true }));
+		process.env.CLINE_GLOBAL_SETTINGS_PATH = settingsPath;
+		delete process.env.IS_DEV;
+		delete process.env.CLINE_NO_AUTO_UPDATE;
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockRejectedValue(new Error("should not fetch"));
+
+		autoUpdateOnStartup();
+
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("checks the fork's GitHub Releases for manual updates", async () => {
+		process.env.CLINE_FORK_REPO = "ConnorVG/cline";
+		const settingsPath = createTempFile("data/global-settings.json");
+		writeFileSync(settingsPath, JSON.stringify({ autoUpdateEnabled: false }));
+		process.env.CLINE_GLOBAL_SETTINGS_PATH = settingsPath;
+		delete process.env.CLINE_NO_AUTO_UPDATE;
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+			ok: true,
+			json: async () => ({ tag_name: "cli-v9.9.9" }),
+		} as Response);
+
+		await checkForUpdates({ includeKanban: false });
+
+		const url = fetchSpy.mock.calls[0]?.[0] as string;
+		expect(url).toContain("api.github.com/repos/ConnorVG/cline/releases/latest");
 	});
 });
 
